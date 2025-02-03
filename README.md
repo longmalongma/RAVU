@@ -17,7 +17,7 @@ Long video understanding with Large Language Models (LLMs) enables the descripti
 
 ## Model Overview
 <p align="center">
-<img src="figs/architecture.png" alt="model" width="80%">
+<img src="architecture.png" alt="model" width="80%">
 </p>
 
 
