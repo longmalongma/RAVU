@@ -5,7 +5,7 @@ torchrun --nproc_per_node=4 \
     train.py \
     --cfg-path lavis/projects/malmm/qa_msvd.yaml \
     --options \
-    model.arch blip2_vicuna_instruct \
+    model.arch blip2_vicuna_instruct_memory \
     model.model_type vicuna7b \
     model.load_finetuned False \
     model.load_pretrained True \
