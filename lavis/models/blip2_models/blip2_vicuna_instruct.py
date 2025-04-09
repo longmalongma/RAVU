@@ -1,0 +1,1076 @@
+"""
+Requires Transformer 4.28 and above, implementation may change according the Llama implementation
+"""
+import logging
+import string
+from packaging import version
+
+from Qformer import BertConfig, BertLMHeadModel
+from models.Qformer_txt import BertLMHeadModel_txt
+import torch
+from torch.cuda.amp import autocast as autocast
+import torch.nn as nn
+import pickle
+import faiss
+import re
+import transformers
+
+from lavis.common.registry import registry
+from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train, memory_bank_compress
+#from evcap import EVCap  # 假设 EVCap 在 your_module.py 中
+
+@registry.register_model("blip2_vicuna_instruct_malmm")
+class Blip2VicunaInstruct_MALMM(Blip2Base):
+    PRETRAINED_MODEL_CONFIG_DICT = {
+        "vicuna7b": "configs/models/blip2/blip2_instruct_vicuna7b.yaml",
+        "vicuna13b": "configs/models/blip2/blip2_instruct_vicuna13b.yaml",
+    }
+
+    def __init__(
+        self,
+        ext_path,
+        topn=9,
+        low_resource=False,
+        vit_model="eva_clip_g",
+        freeze_qformer=True,
+        q_former_model="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained_flant5xxl.pth",
+        num_query_token_txt=32,
+        img_size=224,
+        drop_path_rate=0,
+        use_grad_checkpoint=False,
+        vit_precision="fp16",
+        freeze_vit=True,
+        num_query_token=32,
+        llm_model="",
+        prompt="",
+        max_txt_len=128,
+        max_output_txt_len=256,
+        apply_lemmatizer=False,
+        qformer_text_input=True,
+        memory_bank_length=0,
+        num_frames=0,
+        max_num_frames=120,
+    ):
+        super().__init__()
+        transformers_version = version.parse(transformers.__version__)
+        assert transformers_version >= version.parse("4.28"), "BLIP-2 Vicuna requires transformers>=4.28"        
+        from transformers import LlamaTokenizer
+        from lavis.models.blip2_models.modeling_llama import LlamaForCausalLM
+        
+        self.tokenizer = self.init_tokenizer(truncation_side="left")
+
+        self.visual_encoder, self.ln_vision = self.init_vision_encoder(
+            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+        )
+        if freeze_vit:
+            for name, param in self.visual_encoder.named_parameters():
+                param.requires_grad = False
+            self.visual_encoder = self.visual_encoder.eval()
+            self.visual_encoder.train = disabled_train
+            logging.info("freeze vision encoder")
+
+        self.Qformer, self.query_tokens = self.init_Qformer(
+            num_query_token, self.visual_encoder.num_features, memory_bank_length=memory_bank_length, num_frames=num_frames,
+        )
+
+        if not qformer_text_input:
+            self.Qformer.bert.embeddings.word_embeddings = None
+            self.Qformer.bert.embeddings.position_embeddings = None
+            for layer in self.Qformer.bert.encoder.layer:
+                layer.output = None
+                layer.intermediate = None
+        else:
+            self.Qformer.resize_token_embeddings(len(self.tokenizer))
+        self.Qformer.cls = None
+       
+
+        self.topn = topn
+        print('topn:', self.topn)
+
+        self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False, truncation_side="left")
+        self.llm_model = LlamaForCausalLM.from_pretrained(
+            llm_model, torch_dtype=torch.float16
+        )
+        self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
+        self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
+        self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
+        # self.llm_tokenizer.pad_token = self.llm_tokenizer.unk_token
+
+        self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
+
+        # self.eos_token_id = self.llm_tokenizer(
+        #     self.llm_tokenizer.eos_token, add_special_tokens=False
+        # ).input_ids[0]
+
+        for name, param in self.llm_model.named_parameters():
+            param.requires_grad = False
+
+        self.llm_proj = nn.Linear(
+            self.Qformer.config.hidden_size, self.llm_model.config.hidden_size
+        )
+
+        self.max_txt_len = max_txt_len
+        self.max_output_txt_len = max_output_txt_len
+        self.prompt = prompt
+        prompt_tokens = self.llm_tokenizer(self.prompt, return_tensors="pt")
+        self.prompt_length = prompt_tokens.attention_mask.sum(1)
+        self.low_resource = low_resource
+
+        self._lemmatizer = None
+
+        self.qformer_text_input = qformer_text_input
+        self.num_query_token = num_query_token
+        self.memory_bank_length = memory_bank_length
+        self.use_memory_bank = True if memory_bank_length > 0 else False
+        self.num_frames = num_frames
+        self.visual_memory_bank = None
+        self.image_pe = nn.Embedding(max_num_frames, 1408)
+        nn.init.constant_(self.image_pe.weight, 0.0)
+ 
+        
+        with open(ext_path, 'rb') as f:
+            ext_base_img, self.ext_base_img_id = pickle.load(f)
+            print(ext_base_img.shape, len(self.ext_base_img_id))
+            feature_library_cpu = ext_base_img.cpu().numpy()
+            faiss.normalize_L2(feature_library_cpu)
+            self.feat_index = faiss.IndexFlatIP(feature_library_cpu.shape[1])
+            self.feat_index.add(feature_library_cpu)
+            print(f"loaded external base image")
+
+        
+        self.bert_tokenizer = self.init_tokenizer()
+        
+        self.Qformer_txt, self.query_tokens_txt = self.init_Qformer_txt(
+            num_query_token_txt, self.Qformer.config.hidden_size
+        )
+        self.Qformer_txt.resize_token_embeddings(len(self.bert_tokenizer))
+        self.Qformer_txt.cls = None
+        self.load_from_pretrained(url_or_filename=q_former_model)
+        if freeze_qformer:
+            for name, param in self.Qformer_txt.named_parameters():
+                param.requires_grad = False
+            self.Qformer_txt = self.Qformer_txt.eval()
+            self.Qformer_txt.train = disabled_train
+            self.query_tokens_txt.requires_grad = True
+            logging.info("freeze Qformer")
+        print('query_tokens_txt', self.query_tokens_txt.shape)
+        print('Loading Q-Former Done')
+        print('Loading Q-Former_txt Done')
+        '''
+        self.evcap_model = EVCap(
+            ext_path='path_to_your_external_image_data.pkl',
+            vit_model="eva_clip_g",
+            q_former_model="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained_flant5xxl.pth",
+            topn=9,
+            prompt_path="prompts/prompt_evcap.txt",
+            prompt_template='###Human: {} ###Assistant: ',
+            max_txt_len=self.max_txt_len,
+            end_sym='\n',
+            low_resource=False,
+            device_8bit=0,
+        )
+        '''
+
+    
+    @classmethod
+    def init_Qformer_txt(cls, num_query_token, vision_width, cross_attention_freq=2):
+        encoder_config = BertConfig.from_pretrained("bert-base-uncased")
+        encoder_config.encoder_width = vision_width
+        # insert cross-attention layer every other block
+        encoder_config.add_cross_attention = True
+        encoder_config.cross_attention_freq = cross_attention_freq
+        encoder_config.query_length = num_query_token
+        Qformer = BertLMHeadModel_txt(config=encoder_config)
+        query_tokens = nn.Parameter(
+            torch.zeros(1, num_query_token, encoder_config.hidden_size)
+        )
+        query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        return Qformer, query_tokens
+
+
+
+
+
+
+
+    def vit_to_cpu(self):
+        self.ln_vision.to("cpu")
+        self.ln_vision.float()
+        self.visual_encoder.to("cpu")
+        self.visual_encoder.float()
+    
+    
+    def concat_text_input_output(self, input_ids, input_atts, output_ids, output_atts):
+        input_part_targets_len = []
+        llm_tokens = {"input_ids": [], "attention_mask": []}
+        for i in range(input_ids.size(0)):
+            this_input_ones = input_atts[i].sum()
+            input_part_targets_len.append(this_input_ones)
+            llm_tokens['input_ids'].append(
+                torch.cat([
+                    input_ids[i][:this_input_ones],
+                    output_ids[i][1:],
+                    input_ids[i][this_input_ones:]
+                ])
+            )
+            llm_tokens['attention_mask'].append(
+                torch.cat([
+                    input_atts[i][:this_input_ones],
+                    output_atts[i][1:],
+                    input_atts[i][this_input_ones:]
+                ])
+            )
+        llm_tokens['input_ids'] = torch.stack(llm_tokens['input_ids'])
+        llm_tokens['attention_mask'] = torch.stack(llm_tokens['attention_mask'])
+        return llm_tokens, input_part_targets_len
+
+    def pre_name(self, caption):
+        caption = re.sub(
+            r"([_!,'\"()*#:;~])",
+            " ",
+            caption.lower(),
+        )
+        caption = re.sub(
+            r"\s{2,}",
+            " ",
+            caption,
+        )
+        caption = caption.rstrip("\n")
+        caption = caption.strip(" ")
+        return caption
+    
+    
+    def retrieve_similar_features(self, query_features, feat_index, image_id, top_k = 5, sub_top_k = 32):
+        batch_size, nums, dims = query_features.shape
+        query_features = query_features.view(-1,dims)   
+
+        query_features_cpu = query_features.detach().cpu().numpy()
+        faiss.normalize_L2(query_features_cpu)
+        top_k_similarities, top_k_indices = feat_index.search(query_features_cpu, top_k)
+
+        top_k_indices = torch.tensor(top_k_indices).to(device = query_features.device)
+        top_k_similarities = torch.tensor(top_k_similarities).to(device = query_features.device)
+        top_k_similarities = top_k_similarities.view(batch_size, -1)
+
+        indices = top_k_indices.view(batch_size, -1)
+
+        re_txt_list_all = []    
+        for batch_i in range(batch_size):
+            indices_list = indices[batch_i]
+            re_txt_batch_list = []
+            for i in indices_list: 
+                re_txt_batch_list.append(image_id[i])
+            re_txt_list_all.append(re_txt_batch_list)
+         
+        sorted_batched_ret = []
+        for listA, listB in zip(top_k_similarities, re_txt_list_all):
+            sorted_listA, indices = listA.sort(descending=True)
+            sorted_listB = [self.pre_name(listB[idx]) for idx in indices]
+            sorted_listB = sorted_listB[:sub_top_k]
+            sorted_batched_ret.append(sorted_listB)
+        return sorted_batched_ret
+    
+    
+    def forward(self, samples):
+        # print('-----------------')
+        # print(samples["text_input"])
+        # print(samples["text_output"])
+        # print('-----------------')
+
+        image = samples["image"]
+        # For video data
+        is_video = False
+        if image.dim() == 5:
+            is_video = True
+            B, C, T, H, W = image.shape
+
+        if self.qformer_text_input:
+            if is_video:
+                text_input = [text for text in samples["text_input"] for _ in range(T)]
+            else:
+                text_input = samples["text_input"]
+
+            if self.use_memory_bank:
+                query_tokens = self.query_tokens.expand(B, -1, -1) # [B, 32, C]
+                text_Qformer = self.tokenizer(
+                    samples["text_input"], # [B]
+                    padding='longest',
+                    truncation=True,
+                    max_length=self.max_txt_len,
+                    return_tensors="pt",
+                ).to(image.device)
+                query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device) # [B, N]
+                Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask],dim=1)
+                for t in range(T):
+                    with self.maybe_autocast():
+                        image_embeds = self.ln_vision(self.visual_encoder(image[:, :, t, :, :])) #[B, 256+1, 1408]
+                    N, C = image_embeds.shape[-2:]
+                    position_ids = torch.tensor([t]).long().to(image_embeds.device) #[1]
+                    position_ids = position_ids.unsqueeze(0).expand(B, -1) #[B, 1]
+                    image_embeds = image_embeds + self.image_pe(position_ids) # [B, N, C]
+                    image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device) # [B, N]
+                    image_embeds = image_embeds.unsqueeze(1) # [B, 1, N, C]
+
+                    if t == 0:
+                        encoder_hidden_states = image_embeds # [B, 1, N, C]
+                        self.size_constant = torch.ones(B, 1, N).to(image_embeds.device) # [B, 1, N]
+                    else:
+                        encoder_hidden_states = torch.cat([self.visual_memory_bank, image_embeds], dim=1) # [B, (t+1), N, C]
+
+                    query_output = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        attention_mask=Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=encoder_hidden_states.view(B, -1, C),
+                        encoder_attention_mask=image_atts,
+                        return_dict=True,
+                    )
+
+                    # If it is the first frame, initialize the visual_memory_bank as the embedding of the first frame
+                    # If not, concatenate the visual_memory_bank with the current frame embedding and update the compression_size
+                    if t == 0:
+                        self.visual_memory_bank = image_embeds.detach()  # [B, 1, N, C]
+                        self.compression_size = self.size_constant  # [B, 1, N]
+                    else:
+                        self.visual_memory_bank = torch.cat([self.visual_memory_bank, image_embeds.detach()], dim=1)  # [B, t+1, N, C]
+                        self.compression_size = torch.cat([self.compression_size, self.size_constant], dim=1)  # [B, t+1, N]
+                    
+                    # If it is the last frame, delete the visual_memory_bank and compression_size
+                    # Else, if the current length of the visual_memory_bank exceeds the threshold, compress the visual_memory_bank
+                    if t == T - 1:
+                        del self.visual_memory_bank
+                        del self.compression_size
+                    elif self.visual_memory_bank.size(1) > self.memory_bank_length:
+                        self.visual_memory_bank, self.compression_size = memory_bank_compress(self.visual_memory_bank, self.compression_size)
+            else:
+                query_tokens = self.query_tokens.expand(B * T, -1, -1)
+                text_Qformer = self.tokenizer(
+                    text_input,
+                    padding='longest',
+                    truncation=True,
+                    max_length=self.max_txt_len,
+                    return_tensors="pt",
+                ).to(image.device)
+                query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
+                Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
+
+                if is_video:
+                    image = image.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+                with self.maybe_autocast():
+                    image_embeds = self.ln_vision(self.visual_encoder(image)) #[B * T, 256+1, 1408]
+                image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+                query_output = self.Qformer.bert(
+                    text_Qformer.input_ids,
+                    attention_mask=Qformer_atts,
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                    return_dict=True,
+                )
+        else:
+            if is_video:
+                image = image.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+            with self.maybe_autocast():
+                image_embeds = self.ln_vision(self.visual_encoder(image)) #[B * T, 256+1, 1408]
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            query_tokens = self.query_tokens.expand(B * T, -1, -1)
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+
+        inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+        if is_video:
+            inputs_llm = inputs_llm.reshape(B, -1, inputs_llm.shape[-1])
+        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
+
+        self.llm_tokenizer.padding_side = "right"
+        self.llm_tokenizer.truncation_side = 'left'
+        text_input_tokens = self.llm_tokenizer(
+            samples['text_input'],
+            return_tensors="pt",
+            padding="longest",
+            truncation=True,
+            max_length=self.max_txt_len,
+        ).to(image.device)
+
+        self.llm_tokenizer.truncation_side = 'right'
+        text_output_tokens = self.llm_tokenizer(
+            [t + self.llm_tokenizer.eos_token for t in samples['text_output']],
+            return_tensors="pt",
+            padding="longest",
+            truncation=True,
+            max_length=self.max_output_txt_len,
+        ).to(image.device)
+
+        llm_tokens, input_part_targets_len = self.concat_text_input_output(
+            text_input_tokens.input_ids,
+            text_input_tokens.attention_mask,
+            text_output_tokens.input_ids,
+            text_output_tokens.attention_mask,
+        )
+
+        # do not apply loss to the padding
+        targets = llm_tokens['input_ids'].masked_fill(
+            llm_tokens['input_ids'] == self.llm_tokenizer.pad_token_id, -100
+        )
+
+        # do not apply loss to the text input (i.e., instruction)
+        for i, l in enumerate(input_part_targets_len):
+            targets[i][:l] = -100
+
+        # do not apply loss to the query tokens
+        empty_targets = (
+            torch.ones(atts_llm.size(), dtype=torch.long).to(image.device).fill_(-100)
+        )
+        targets = torch.cat([empty_targets, targets], dim=1)
+
+        inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens['input_ids'])
+        inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
+        attention_mask = torch.cat([atts_llm, llm_tokens['attention_mask']], dim=1)
+
+        with self.maybe_autocast():
+            outputs = self.llm_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                return_dict=True,
+                labels=targets,
+            )
+
+        loss = outputs.loss
+
+        return {"loss": loss}
+
+    @torch.no_grad()
+    def generate(
+        self,
+        samples,
+        use_nucleus_sampling=False,
+        num_beams=5,
+        max_length=256,
+        min_length=1,
+        top_p=0.9,
+        repetition_penalty=1.5,
+        length_penalty=1,
+        num_captions=1,
+        temperature=1,
+    ):
+        self.llm_tokenizer.padding_side = "left"
+
+        if "prompt" in samples.keys():
+            prompt = samples["prompt"]
+        else:
+            prompt = self.prompt
+        
+        
+        image = samples["image"]
+        device = image.device
+        if self.low_resource:
+            self.vit_to_cpu()
+            image = image.to("cpu")
+
+        # For video data
+        is_video = False
+        if image.dim() == 5:
+            is_video = True
+            B, C, T, H, W = image.shape
+
+        if isinstance(prompt, str):
+            prompt = [prompt] * B
+        else:
+            assert len(prompt) == B, "The number of prompts must be equal to the batch size."
+
+        # For TextCaps
+        if "ocr_tokens" in samples.keys() and "{}" in prompt[0]:
+            prompt = [p.format(', '.join(samples['ocr_tokens'][i][:30])) for i, p in enumerate(prompt)]
+
+        assert self.qformer_text_input == True
+        if self.qformer_text_input:
+            # remove ocr tokens in q_former (for eval textvqa)
+            # qformer_prompt = prompt
+            # qformer_prompt = ['Question: ' + qp.split(' Question: ')[1] for qp in qformer_prompt]
+
+            if is_video:
+                text_input = []
+                for text in prompt:
+                    text_input.extend([text] * T)
+            else:
+                text_input = prompt
+
+            if self.use_memory_bank:
+                query_tokens = self.query_tokens.expand(B, -1, -1)  # [B, 32, C]
+                text_Qformer = self.tokenizer(
+                    prompt,  # [B]
+                    padding='longest',
+                    truncation=True,
+                    max_length=self.max_txt_len,
+                    return_tensors="pt",
+                ).to(image.device)
+                query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)  # [B, 32]
+                Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
+
+                for t in range(T):
+                    with self.maybe_autocast():
+                        image_embeds = self.ln_vision(self.visual_encoder(image[:, :, t, :, :])).detach()  # [B, 256+1, 1408]
+                        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
+                    #query_output_all, atts_query_all_proj = self.evcap_model.encode_img(image)
+                    #image_embeds = torch.cat((image_embeds1, query_output_all), dim=-1)  # [B, N, D1 + D2]
+
+                    N, C = image_embeds.shape[-2:]
+                    position_ids = torch.tensor([t]).long().to(image_embeds.device)  # [1]
+                    position_ids = position_ids.unsqueeze(0).expand(B, -1)  # [B, 1]
+                    image_pe = self.image_pe(position_ids)  # [B, 1, C]
+                    image_embeds_all = image_embeds + image_pe  # [B, N, C]
+                    image_atts_all = torch.ones(image_embeds_all.size()[:-1], dtype=torch.long).to(image.device)  # [B, N]
+                    image_embeds_all = image_embeds_all.unsqueeze(1)  # [B, 1, N, C]
+                    
+
+
+                    #query_output_all, atts_query_all = self.evcap_model.encode_img(image)
+
+                    if t == 0:
+                        self.visual_memory_bank = image_embeds_all  # [B, 1, N, C]
+                        self.size_constant = torch.ones(B, 1, N).to(image_embeds_all.device)  # [B, 1, N]
+                        self.compression_size = self.size_constant  # [B, 1, N]
+                    else:
+                        self.visual_memory_bank = torch.cat([self.visual_memory_bank, image_embeds_all], dim=1)  # [B, t+1, N, C]
+                        self.compression_size = torch.cat([self.compression_size, self.size_constant], dim=1)  # [B, t+1, N]
+                    
+
+                    query_outputs_img_all = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        attention_mask=Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=self.visual_memory_bank.view(B, -1, C),
+                        encoder_attention_mask=image_atts_all,
+                        return_dict=True,
+                    )
+                    query_output_img_all = query_outputs_img_all.last_hidden_state
+                    query_output_img_atts_all = torch.ones(query_output_img_all.size()[:-1], dtype=torch.long).to(device)
+                    
+                    
+                    query_outputs_img = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=image_embeds,
+                        encoder_attention_mask=image_atts,
+                        return_dict=True,
+                    )
+                    query_output_img = query_outputs_img.last_hidden_state
+                    query_output_img_atts = torch.ones(query_output_img.size()[:-1], dtype=torch.long).to(device)
+                    re_txt_list_all  = self.retrieve_similar_features(query_output_img, self.feat_index, self.ext_base_img_id)
+                    re_txt_list_batch = []
+                    for sublist in re_txt_list_all:
+                        sublist_new = []
+                        for item in sublist:
+                            if item not in sublist_new:
+                                sublist_new.append(item)
+                                if len(sublist_new)>self.topn: 
+                                    break
+                        re_txt_list_batch.append(" [SEP] ".join(sublist_new))
+
+                    text = self.bert_tokenizer(
+                            re_txt_list_batch,
+                            truncation=True,
+                            padding="longest",
+                            max_length=self.max_txt_len,
+                            return_tensors="pt",
+                        ).to(image.device)
+
+                    #query_tokens_txt = self.query_tokens_txt.expand(image_embeds.shape[0], -1, -1)
+                    query_atts_all = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
+                        image_embeds_all.device
+                    )
+
+                    query_output_img_atts = torch.ones(query_output_img_all.size()[:-1], dtype=torch.long).to(device)
+                    query_output_img_atts = torch.cat([query_atts_all, query_output_img_atts], dim=1)
+
+
+                    #attention_mask = text.attention_mask
+                    query_outputs_txt = self.Qformer_txt.bert(
+                        text.input_ids,
+                        query_embeds=query_tokens,
+                        attention_mask=Qformer_atts,
+                        encoder_hidden_states=query_output_img_all,
+                        encoder_attention_mask=query_output_img_atts,
+                        return_dict=True,
+                    )
+                    query_output_txt = query_outputs_txt.last_hidden_state[:, : query_tokens.size(1), :]
+
+                    query_output = torch.cat([query_output_img, query_output_txt], dim=1) 
+                    ##qform_all_proj = self.llama_proj(query_output_all)
+                    atts_query_all_proj = torch.ones(query_output[:-1], dtype=torch.long).to(device)
+                    
+                    '''
+                    query_output = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        attention_mask=Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=self.visual_memory_bank.view(B, -1, C),
+                        encoder_attention_mask=image_atts,
+                        return_dict=True,
+                    )
+                    '''
+                    last_hidden_state = query_output.last_hidden_state
+                    
+                    if t == T - 1:
+                        del self.visual_memory_bank
+                        del self.compression_size
+                    elif self.visual_memory_bank.size(1) > self.memory_bank_length:
+                        self.visual_memory_bank, self.compression_size = memory_bank_compress(self.visual_memory_bank,
+                                                                                               self.compression_size)
+
+            else:
+                query_tokens = self.query_tokens.expand(B * T, -1, -1)
+                text_Qformer = self.tokenizer(
+                    text_input, # [B*T]
+                    padding='longest',
+                    truncation=True,
+                    max_length=self.max_txt_len,
+                    return_tensors="pt",
+                ).to(image.device)
+                query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
+                Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
+
+                if is_video:
+                    image = image.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+                with self.maybe_autocast():
+                    image_embeds = self.ln_vision(self.visual_encoder(image)) #[B * T, 256+1, 1408]
+                image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+                query_output = self.Qformer.bert(
+                    text_Qformer.input_ids,
+                    attention_mask=Qformer_atts,
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                    return_dict=True,
+                )
+        else:
+            if is_video:
+                image = image.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+            with self.maybe_autocast():
+                image_embeds = self.ln_vision(self.visual_encoder(image)) #[B * T, 256+1, 1408]
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            query_tokens = self.query_tokens.expand(B * T, -1, -1)
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+
+        inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+        if is_video:
+            inputs_llm = inputs_llm.reshape(B, -1, inputs_llm.shape[-1])
+        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
+
+        llm_tokens = self.llm_tokenizer(
+            prompt,
+            padding="longest",
+            return_tensors="pt"
+        ).to(image.device)
+
+        with self.maybe_autocast():
+            inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+            inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
+            attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
+
+            outputs = self.llm_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                do_sample=use_nucleus_sampling,
+                top_p=top_p,
+                temperature=temperature,
+                num_beams=num_beams,
+                max_length=max_length,
+                min_length=min_length,
+                # eos_token_id=self.eos_token_id,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+                num_return_sequences=num_captions,
+            )
+
+        outputs[outputs < 2] = 2 # convert output id -1/0/1 to 2 (eos_token_id)
+        output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        output_text = [text.strip() for text in output_text]
+
+        return output_text
+
+    def predict_answers(
+        self,
+        samples,
+        num_beams=5,
+        inference_method="generate",
+        max_len=10,
+        min_len=1,
+        num_ans_candidates=128,
+        answer_list=None,
+        prompt="",
+        length_penalty=0,
+        **kwargs
+    ):
+        if isinstance(samples["text_input"], str):
+            samples["text_input"] = [samples["text_input"]]
+
+        if prompt:
+            if prompt.count("{}") == 2:
+                if 'ocr_tokens' in samples:
+                    text_input = [
+                        prompt.format(', '.join(samples['ocr_tokens'][i][:30]), samples["text_input"][i])
+                    for i in range(len(samples["text_input"]))]
+                elif 'choices' in samples:
+                    text_input = []
+                    for i in range(len(samples["text_input"])):
+                        this_choices = [f"({string.ascii_lowercase[j]}) {ch}" for j, ch in enumerate(samples["choices"][i])]
+                        this_choices = " ".join(this_choices)
+                        text_input.append(prompt.format(samples["text_input"][i], this_choices))
+            else:
+                text_input = [prompt.format(question) for question in samples["text_input"]]
+        else:
+            text_input = samples["text_input"]
+
+        samples["prompt"] = text_input
+
+        output_text = self.generate(
+            samples,
+            num_beams=num_beams,
+            max_length=max_len,
+            min_length=min_len,
+            length_penalty=length_penalty,
+            num_captions=num_beams,
+        )
+
+        if "apply_lemmatizer" in samples.keys() and samples["apply_lemmatizer"]:
+            output_text = self._lemmatize(output_text)
+
+        return output_text
+
+    def predict_class(
+        self,
+        samples,
+        candidates,
+        n_segments=1,
+    ):
+        self.llm_tokenizer.padding_side = "left"
+
+        # If candidates is a list of lists, each sample has its candidates, then we need to iterate one by one
+        if type(candidates[0]) == list:
+            results = []
+
+            for i in range(samples["image"].size(0)):
+                this_sample = {
+                    "image": samples["image"][i].unsqueeze(0),
+                    "prompt": samples["prompt"],
+                }
+
+                if "text_input" in samples.keys():
+                    this_sample["text_input"] = [samples["text_input"][i]]
+
+                if 'context' in samples.keys():
+                    this_sample['context'] = [samples["context"][i]]
+
+                if 'history' in samples.keys():
+                    this_sample['history'] = [samples["history"][i]]
+
+                if 'caption' in samples.keys():
+                    this_sample['caption'] = [samples["caption"][i]]
+
+                this_result = self._predict_class(this_sample, candidates[i], n_segments)
+                results.append(this_result)
+
+            try:
+                results = torch.cat(results, dim=0)
+            except:
+                results = [res.tolist()[0] for res in results]
+
+            return results
+
+        return self._predict_class(samples, candidates, n_segments)
+
+    def _predict_class(
+        self,
+        samples,
+        candidates,
+        n_segments=1,
+    ):
+        image = samples["image"]
+        prompt = samples["prompt"]
+
+        bs = image.size(0)
+
+        if isinstance(prompt, str):
+            prompt = [prompt] * bs
+        else:
+            assert len(prompt) == bs, "The number of prompts must be equal to the batch size."
+
+        if "text_input" in samples.keys():
+            if type(samples["text_input"][0]) == list:
+                prompt = [prompt[i].format(*samples["text_input"][i]) for i in range(len(prompt))]
+            else:
+                prompt = [prompt[i].format(samples["text_input"][i]) for i in range(len(prompt))]
+
+        # scienceqa
+        if 'context' in samples.keys() and samples['context'] != '':
+            prompt = [f'context: {samples["context"][i]}. {prompt[i]}' for i in range(len(prompt))]
+
+        # visual dialog
+        if 'history' in samples.keys() and samples['history'][0] != '':
+            prompt = [f'dialog history: {samples["history"][i]}\n{prompt[i]}' for i in range(len(prompt))]
+
+        if 'caption' in samples.keys() and samples['caption'][0] != '':
+            prompt = [f'This image has the caption "{samples["caption"][i]}". {prompt[i]}' for i in range(len(prompt))]
+
+        query_tokens = self.query_tokens.expand(bs, -1, -1)
+        if self.qformer_text_input:
+            text_Qformer = self.tokenizer(
+                prompt,
+                padding='longest',
+                truncation=True,
+                max_length=self.max_txt_len,
+                return_tensors="pt"
+            ).to(image.device)
+            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
+            Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask], dim=1)
+
+        if image.dim() == 5:
+            inputs_llm, atts_llm = [], []
+            for j in range(image.size(2)):
+                this_frame = image[:,:,j,:,:]
+                with self.maybe_autocast():
+                    frame_embeds = self.ln_vision(self.visual_encoder(this_frame))
+                    frame_atts = torch.ones(frame_embeds.size()[:-1], dtype=torch.long).to(image.device)
+
+                if self.qformer_text_input:
+                    frame_query_output = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        attention_mask=Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=frame_embeds,
+                        encoder_attention_mask=frame_atts,
+                        return_dict=True,
+                    )
+                else:
+                    frame_query_output = self.Qformer.bert(
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=frame_embeds,
+                        encoder_attention_mask=frame_atts,
+                        return_dict=True,
+                    )
+
+                frame_inputs_llm = self.llm_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
+                frame_atts_llm = torch.ones(frame_inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
+                inputs_llm.append(frame_inputs_llm)
+                atts_llm.append(frame_atts_llm)
+            inputs_llm = torch.cat(inputs_llm, dim=1)
+            atts_llm = torch.cat(atts_llm, dim=1)
+        else:
+            with self.maybe_autocast():
+                image_embeds = self.ln_vision(self.visual_encoder(image))
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+
+            if self.qformer_text_input:
+                query_output = self.Qformer.bert(
+                    text_Qformer.input_ids,
+                    attention_mask=Qformer_atts,
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                    return_dict=True,
+                )
+            else:
+                query_output = self.Qformer.bert(
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                    return_dict=True,
+                )
+
+            inputs_llm = self.llm_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+            atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(image.device)
+
+        self.llm_tokenizer.padding_side = "right"
+        self.llm_tokenizer.truncation_side = 'left'
+        text_input_tokens = self.llm_tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding="longest",
+            # truncation=True,
+            # max_length=self.max_txt_len,
+        ).to(image.device)
+
+        empty_targets = torch.ones(atts_llm.size(), dtype=torch.long).to(image.device).fill_(-100)
+
+        # self.llm_tokenizer.padding_side = "right"
+        self.llm_tokenizer.truncation_side = 'right'
+        n_cands = len(candidates)
+        with self.maybe_autocast(dtype=torch.bfloat16):
+            all_losses = []
+            for n in range(n_segments):
+                seg_len = n_cands // n_segments
+                if n == (n_segments - 1):
+                    seg_len = n_cands - seg_len * (n_segments - 1)
+
+                start_i = n * (n_cands // n_segments)
+                end_i = start_i + seg_len
+
+                this_output_tokens = self.llm_tokenizer(
+                    candidates[start_i:end_i],
+                    return_tensors="pt",
+                    padding="longest",
+                    # truncation=True,
+                    # max_length=self.max_output_txt_len,
+                ).to(image.device)
+
+                this_input_tokens_ids = text_input_tokens.input_ids.repeat_interleave(seg_len, dim=0)
+                this_input_tokens_atts = text_input_tokens.attention_mask.repeat_interleave(seg_len, dim=0)
+
+                this_output_tokens_ids = this_output_tokens.input_ids.repeat(bs, 1)
+                this_output_tokens_atts = this_output_tokens.attention_mask.repeat(bs, 1)
+
+                this_llm_tokens, this_input_targets_len = self.concat_text_input_output(
+                    this_input_tokens_ids,
+                    this_input_tokens_atts,
+                    this_output_tokens_ids,
+                    this_output_tokens_atts
+                )
+
+                this_llm_input_ids = this_llm_tokens['input_ids']
+                this_llm_atts = this_llm_tokens['attention_mask']
+                # this_llm_input_ids = torch.cat([this_input_tokens_ids, this_output_tokens_ids], dim=1)
+                # this_llm_atts = torch.cat([this_input_tokens_atts, this_output_tokens_atts], dim=1)
+
+                inputs_embeds = self.llm_model.get_input_embeddings()(this_llm_input_ids)
+                inputs_embeds = torch.cat([inputs_llm.repeat_interleave(seg_len, dim=0), inputs_embeds], dim=1)
+                attention_mask = torch.cat([atts_llm.repeat_interleave(seg_len, dim=0), this_llm_atts], dim=1)
+
+                this_targets = this_llm_input_ids.masked_fill(this_llm_input_ids == self.llm_tokenizer.pad_token_id, -100)
+                # this_targets[:, :this_input_tokens_ids.size(1)] = -100
+                for i, l in enumerate(this_input_targets_len):
+                    this_targets[i][:l] = -100
+
+                this_targets = torch.cat([empty_targets.repeat_interleave(seg_len, dim=0), this_targets], dim=1)
+
+                outputs = self.llm_model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    labels=this_targets,
+                    reduction="none",
+                )
+
+                loss = outputs.loss
+
+                loss = loss.reshape(bs, seg_len)
+                # output_class_ranks = torch.argsort(loss, dim=-1)
+                all_losses.append(loss)
+
+            all_losses = torch.cat(all_losses, dim=-1)
+            output_class_ranks = torch.argsort(all_losses, dim=-1)
+
+        return output_class_ranks
+
+    def _lemmatize(self, answers):
+        def apply(answer):
+            doc = self.lemmatizer(answer)
+
+            words = []
+            for token in doc:
+                if token.pos_ in ["NOUN", "VERB"]:
+                    words.append(token.lemma_)
+                else:
+                    words.append(token.text)
+            answer = " ".join(words)
+
+            return answer
+
+        return [apply(answer) for answer in answers]
+
+    @property
+    def lemmatizer(self):
+        if self._lemmatizer is None:
+            try:
+                import spacy
+
+                self._lemmatizer = spacy.load("en_core_web_sm")
+            except ImportError:
+                logging.error(
+                    """
+                    Please install spacy and en_core_web_sm model to apply lemmatization.
+                    python -m spacy download en_core_web_sm
+                    OR
+                    import spacy.cli
+                    spacy.cli.download("en_core_web_sm")
+                    """
+                )
+                exit(1)
+
+        return self._lemmatizer
+
+    @classmethod
+    def from_config(cls, cfg):
+        vit_model = cfg.get("vit_model", "eva_clip_g")
+        img_size = cfg.get("image_size")
+        num_query_token = cfg.get("num_query_token")
+        llm_model = cfg.get("llm_model")
+        memory_bank_length = cfg.get("memory_bank_length", 0)
+        num_frames = cfg.get("num_frames", 0)
+        max_num_frames = cfg.get("max_num_frames", 120)
+        ext_path = cfg.get("ext_path", '/home/longma/MA-LMM/ext_data/ext_memory_lvis.pkl')
+
+        drop_path_rate = cfg.get("drop_path_rate", 0)
+        use_grad_checkpoint = cfg.get("use_grad_checkpoint", False)
+        vit_precision = cfg.get("vit_precision", "fp16")
+        freeze_vit = cfg.get("freeze_vit", True)
+
+        prompt = cfg.get("prompt", "")
+        max_txt_len = cfg.get("max_txt_len", 128)
+        max_output_txt_len = cfg.get("max_output_txt_len", 256)
+        low_resource = cfg.get("low_resource", False)
+
+        topn = cfg.get("topn", 9)
+
+        
+        freeze_qformer = cfg.get("freeze_qformer", True)
+
+        q_former_model = cfg.get("q_former_model", "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained_flant5xxl.pth")
+
+        apply_lemmatizer = cfg.get("apply_lemmatizer", False)
+
+        qformer_text_input = cfg.get("qformer_text_input", True)
+
+        model = cls(
+            vit_model=vit_model,
+            img_size=img_size,
+            ext_path = ext_path,
+            low_resource=low_resource,
+            freeze_qformer = freeze_qformer,
+            q_former_model = q_former_model,
+            topn = topn,
+            drop_path_rate = drop_path_rate,
+            use_grad_checkpoint=use_grad_checkpoint,
+            vit_precision=vit_precision,
+            freeze_vit=freeze_vit,
+            num_query_token=num_query_token,
+            llm_model=llm_model,
+            prompt=prompt,
+            max_txt_len=max_txt_len,
+            max_output_txt_len=max_output_txt_len,
+            apply_lemmatizer=apply_lemmatizer,
+            qformer_text_input=qformer_text_input,
+            memory_bank_length=memory_bank_length,
+            num_frames=num_frames,
+            max_num_frames=max_num_frames,
+        )
+
+        # if qformer_text_input:
+        #     # Hard-coded to load from BLIP-2 stage-1 pre-trained model (not ideal)
+        #     model.load_from_pretrained(
+        #         url_or_filename="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained.pth"
+        #     )
+
+        model.load_checkpoint_from_config(cfg)
+
+        return model
