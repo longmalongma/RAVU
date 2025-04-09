@@ -4,7 +4,7 @@ Requires Transformer 4.28 and above, implementation may change according the Lla
 import logging
 import string
 from packaging import version
-import os
+from PIL import Image
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
@@ -12,7 +12,8 @@ import pickle
 import faiss
 import re
 import transformers
-
+from torchvision import transforms
+#from torchvision.transforms.functional import InterpolationMode
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train, memory_bank_compress
 
@@ -123,47 +124,103 @@ class Blip2VicunaInstruct_MALMM(Blip2Base):
         self.visual_memory_bank = None
         self.image_pe = nn.Embedding(max_num_frames, 1408)
         nn.init.constant_(self.image_pe.weight, 0.0)
+        self.bert_tokenizer = self.init_tokenizer()
         
-        # 定义文件夹路径
-        folder_path = '/home/longma/MA-LMM/lavis/models/blip2_models/action_memory'  # 替换为你的文件夹路径
-        save_path = '/home/longma/MA-LMM/lavis/models/blip2_models/action_memory.pkl'  # 合并后的数据保存路径
+        def preprocess_image(image_path):
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),  
+                transforms.ToTensor(),          
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), 
+            ])
+           
+            image = Image.open(image_path).convert("RGB")
+           
+            return transform(image).unsqueeze(0) 
 
-        # 用于存储拼接后的张量
+        
+        image_folder = "/path/to/your/images" 
+        output_folder = "/path/to/output/pkl_files" 
+
+       
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+
+        
+        image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.endswith(('.jpg', '.jpeg', '.png'))]
+
+      
+        for i, image_path in enumerate(image_paths):
+            print(f"Processing {i+1}/{len(image_paths)}: {image_path}")
+    
+          
+            image = preprocess_image(image_path)
+
+            device = image.device
+            
+            with torch.no_grad():
+                
+                image_embeds = visual_encoder(image)  
+                image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)  
+        
+              
+                query_tokens = query_tokens.expand(image_embeds.shape[0], -1, -1)
+                query_outputs_img = Qformer.bert(
+                    query_embeds=query_tokens,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                    return_dict=True,
+                )
+
+               
+                pkl_filename = f"image_{i+1}_output.pkl"  
+                pkl_filepath = os.path.join(output_folder, pkl_filename)
+        
+                with open(pkl_filepath, "wb") as f:
+                    pickle.dump(query_outputs_img, f)
+                print(f"Saved {pkl_filename} to {output_folder}")
+
+        
+       
+        save_path = "/path/to/final_output.pkl" 
+
+      
         all_tensors = []
 
-        # 获取所有pkl文件路径
-        pkl_files = [f for f in os.listdir(folder_path) if f.endswith('.pkl')]
-        pkl_files.sort()  # 确保文件按顺序处理
+       
+        pkl_files = [f for f in os.listdir(output_folder) if f.endswith('.pkl')]
+        pkl_files.sort()  
 
-        # 遍历每个文件
+      
         for file_name in pkl_files:
-            file_path = os.path.join(folder_path, file_name)
+            file_path = os.path.join(output_folder, file_name)
     
-            # 读取pkl文件中的内容
+            
             with open(file_path, 'rb') as f:
                 output = pickle.load(f)
-        
-                # 检查读取的对象类型
-                if hasattr(output, 'last_hidden_state'):  # 检查是否有 last_hidden_state 属性
-                    tensor_data = output.last_hidden_state  # 提取 last_hidden_state
-            
-                    # 确保 tensor_data 是张量
-                    if isinstance(tensor_data, torch.Tensor):
-                        all_tensors.append(tensor_data)
-                    else:
-                        raise ValueError(f"File {file_name} does not contain a tensor in 'last_hidden_state'.")
-                else:
-                    raise ValueError(f"File {file_name} does not contain 'last_hidden_state'.")
 
-        # 拼接所有张量，假设你是按行拼接（dim=0）
+            
+            if hasattr(output, 'last_hidden_state'): 
+                tensor_data = output.last_hidden_state  
+
+                
+                if isinstance(tensor_data, torch.Tensor):
+                    all_tensors.append(tensor_data)
+                else:
+                    raise ValueError(f"File {file_name} does not contain a tensor in 'last_hidden_state'.")
+            else:
+                raise ValueError(f"File {file_name} does not contain 'last_hidden_state'.")
+
+        
         combined_tensor = torch.cat(all_tensors, dim=0)
 
-        # 将结果保存到一个新的pkl文件
+        
         with open(save_path, 'wb') as f:
             pickle.dump(combined_tensor, f)
 
-        print(f"合并后的张量已保存到 {save_path}")
+        print(f"Finish!")
         
+        
+
         with open(ext_path, 'rb') as f:
             ext_base_img, self.ext_base_img_id = pickle.load(f)
             print(ext_base_img.shape, len(self.ext_base_img_id))
@@ -173,7 +230,7 @@ class Blip2VicunaInstruct_MALMM(Blip2Base):
             self.feat_index.add(feature_library_cpu)
             print(f"loaded external base image")          
 
-        self.bert_tokenizer = self.init_tokenizer()
+        
 
     def vit_to_cpu(self):
         self.ln_vision.to("cpu")
