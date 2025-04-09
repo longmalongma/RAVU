@@ -22,7 +22,7 @@ Long video understanding with Large Language Models (LLMs) enables the descripti
 
 
 ## Demo
-You can explore our demo by running `demo.ipynb`. This demonstration illustrates how our MA-LMM serves as a plug-and-play module that can be integrated into InstructBLIP seamlessly, requiring no fine-tuning for zero-shot evaluation.
+You can explore our demo by running `demo.ipynb`. This demonstration illustrates how our MA-LMM serves as a plug-and-play module that can be integrated into InstructBLIP seamlessly, requiring no fine-tuning for zero-shot evaluation. The Demo code will come soon.
 
 
 ## Requirements
