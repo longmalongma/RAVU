@@ -6,9 +6,10 @@ from tqdm import tqdm
 
 import pdb
 
-dataset = 'breakfast'
-src_base_dir = f'{dataset}/videos'
-dst_base_dir = f'{dataset}/frames'
+dataset = "/home/data1/longma/msva/msvd_data"
+#src_base_dir = f'{dataset}/videos'
+src_base_dir = '/home/data1/longma/msva/msvd_data/videos'
+dst_base_dir = '/home/data1/longma/msva/msvd_data/frames'
 fps = 10
 
 def split_list(l, n):
